@@ -186,11 +186,23 @@
                   { selected: selectedAnnotationId === item.id, dragging: dragState?.id === item.id }
                 ]"
                 :style="annotationStyle(item)"
-                @pointerdown.stop="startAnnotationDrag($event, item)"
-                @click.stop="selectedAnnotationId = item.id"
+                @pointerdown.stop="handleAnnotationPointerDown($event, item)"
+                @click.stop="handleAnnotationClick(item)"
               >
                 <template v-if="item.type === 'text' || item.type === 'field'">
-                  {{ item.value }}
+                  <input
+                    v-if="editingAnnotationId === item.id"
+                    class="text-edit-input"
+                    :value="item.value"
+                    @input="updateAnnotationValue(item.id, ($event.target as HTMLInputElement).value)"
+                    @blur="editingAnnotationId = null"
+                    @keydown.enter.stop="editingAnnotationId = null"
+                    @keydown.escape.stop="editingAnnotationId = null"
+                    @pointerdown.stop
+                    @click.stop
+                    autofocus
+                  />
+                  <span v-else>{{ item.value }}</span>
                 </template>
                 <template v-else-if="item.type === 'comment'">
                   <v-icon icon="mdi-comment-text-outline" size="18" />
@@ -200,9 +212,10 @@
                 <v-btn
                   v-if="selectedAnnotationId === item.id"
                   class="delete-btn"
-                  icon="mdi-trash-can-outline"
+                  icon="mdi-close"
                   size="x-small"
                   color="error"
+                  variant="elevated"
                   @click.stop="deleteAnnotation(item.id)"
                 />
               </div>
@@ -333,6 +346,7 @@ const renderError = ref('');
 const isRendering = ref(false);
 const hasRenderedPage = ref(false);
 const selectedPdfName = ref('');
+const editingAnnotationId = ref<string | null>(null);
 const selectedAnnotationId = ref<string | null>(null);
 const selectedDataField = ref('');
 const signatureCanvas = ref<HTMLCanvasElement | null>(null);
@@ -525,6 +539,7 @@ async function setPage(page: number) {
   const normalizedPage = Math.min(pageCount.value || 1, Math.max(1, Math.trunc(Number(page) || 1)));
   pageInput.value = normalizedPage;
   if (normalizedPage === currentPage.value) return;
+  editingAnnotationId.value = null;
   selectedAnnotationId.value = null;
   dragState.value = null;
   currentPage.value = normalizedPage;
@@ -709,6 +724,27 @@ function insertMappedField() {
   activeTool.value = 'text';
   draftText.value = String(getFieldValue(selectedDataField.value) ?? '');
   showMessage('Click the PDF to place the mapped field.');
+}
+
+function handleAnnotationClick(item: Annotation) {
+  if (selectedAnnotationId.value === item.id && (item.type === 'text' || item.type === 'field')) {
+    editingAnnotationId.value = item.id;
+  } else {
+    selectedAnnotationId.value = item.id;
+    editingAnnotationId.value = null;
+  }
+}
+
+function handleAnnotationPointerDown(event: PointerEvent, item: Annotation) {
+  if (editingAnnotationId.value === item.id) return;
+  startAnnotationDrag(event, item);
+}
+
+function updateAnnotationValue(id: string, value: string) {
+  const annotation = annotations.value.find((a) => a.id === id);
+  if (annotation && (annotation.type === 'text' || annotation.type === 'field')) {
+    (annotation as TextAnnotation).value = value;
+  }
 }
 
 function deleteAnnotation(id: string) {
@@ -1024,7 +1060,7 @@ function readFileBytes(file: File): Promise<Uint8Array> {
   display: flex;
   gap: 6px;
   line-height: 1.3;
-  overflow: hidden;
+  overflow: visible;
   padding: 4px 6px;
   position: absolute;
   touch-action: none;
@@ -1057,6 +1093,7 @@ function readFileBytes(file: File): Promise<Uint8Array> {
 
 .annotation-image,
 .annotation-signature {
+  overflow: hidden;
   padding: 0;
 }
 
@@ -1068,9 +1105,22 @@ function readFileBytes(file: File): Promise<Uint8Array> {
 }
 
 .delete-btn {
+  border-radius: 50% !important;
   position: absolute;
-  right: -10px;
-  top: -10px;
+  right: -12px;
+  top: -12px;
+}
+
+.text-edit-input {
+  background: transparent;
+  border: none;
+  color: inherit;
+  font: inherit;
+  font-weight: 600;
+  min-width: 0;
+  outline: none;
+  padding: 0;
+  width: 100%;
 }
 
 @media (max-width: 900px) {
