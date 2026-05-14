@@ -122,9 +122,35 @@
           <v-btn icon="mdi-minus" variant="text" aria-label="Zoom out" @click="zoomBy(-0.1)" />
           <v-slider v-model="zoom" min="0.6" max="1.8" step="0.05" hide-details class="zoom-slider" />
           <v-btn icon="mdi-plus" variant="text" aria-label="Zoom in" @click="zoomBy(0.1)" />
+          <v-divider vertical class="mx-2" />
+          <v-btn
+            icon="mdi-chevron-left"
+            variant="text"
+            aria-label="Previous page"
+            :disabled="currentPage <= 1 || isRendering"
+            @click="setPage(currentPage - 1)"
+          />
+          <v-text-field
+            v-model.number="pageInput"
+            class="page-input"
+            type="number"
+            min="1"
+            :max="pageCount || 1"
+            hide-details
+            density="compact"
+            @keyup.enter="setPage(pageInput)"
+            @blur="setPage(pageInput)"
+          />
+          <v-btn
+            icon="mdi-chevron-right"
+            variant="text"
+            aria-label="Next page"
+            :disabled="currentPage >= pageCount || isRendering"
+            @click="setPage(currentPage + 1)"
+          />
           <v-spacer />
           <v-chip color="secondary" variant="tonal" prepend-icon="mdi-layers-outline">
-            {{ annotations.length }} items
+            {{ currentPageAnnotations.length }} / {{ annotations.length }} items
           </v-chip>
           <v-chip color="primary" variant="tonal" prepend-icon="mdi-file-document-outline">
             Page {{ currentPage }} / {{ pageCount || 1 }}
@@ -152,11 +178,15 @@
                 <span>Preparing preview</span>
               </div>
               <div
-                v-for="item in annotations"
+                v-for="item in currentPageAnnotations"
                 :key="item.id"
                 class="annotation"
-                :class="[`annotation-${item.type}`, { selected: selectedAnnotationId === item.id }]"
+                :class="[
+                  `annotation-${item.type}`,
+                  { selected: selectedAnnotationId === item.id, dragging: dragState?.id === item.id }
+                ]"
                 :style="annotationStyle(item)"
+                @pointerdown.stop="startAnnotationDrag($event, item)"
                 @click.stop="selectedAnnotationId = item.id"
               >
                 <template v-if="item.type === 'text' || item.type === 'field'">
@@ -189,7 +219,7 @@
 </template>
 
 <script setup lang="ts">
-import { computed, nextTick, onMounted, ref, watch } from 'vue';
+import { computed, markRaw, nextTick, onMounted, ref, shallowRef, watch } from 'vue';
 import { PDFDocument, StandardFonts, rgb } from 'pdf-lib';
 
 type Tool = 'select' | 'text' | 'comment' | 'image' | 'signature';
@@ -212,6 +242,8 @@ interface BaseAnnotation {
   x: number;
   y: number;
   page: number;
+  pageWidth: number;
+  pageHeight: number;
   width: number;
   height: number;
 }
@@ -265,6 +297,15 @@ interface PdfJsGlobal {
   getDocument(options: { data: Uint8Array }): { promise: Promise<PdfJsDocument> };
 }
 
+interface DragState {
+  id: string;
+  pointerId: number;
+  startClientX: number;
+  startClientY: number;
+  startX: number;
+  startY: number;
+}
+
 declare global {
   interface Window {
     pdfjsLib?: PdfJsGlobal;
@@ -279,13 +320,14 @@ const apiResponse = ref<unknown>(null);
 const apiUrl = ref('');
 const currentImage = ref<ImageAsset | null>(null);
 const currentPage = ref(1);
+const pageInput = ref(1);
 const draftComment = ref('Review this section');
 const draftText = ref('New text');
 const pageCount = ref(0);
 const pdfBytes = ref<Uint8Array | null>(null);
 const pdfCanvas = ref<HTMLCanvasElement | null>(null);
 const pdfFileInput = ref<HTMLInputElement | null>(null);
-const pdfDocument = ref<PdfJsDocument | null>(null);
+const pdfDocument = shallowRef<PdfJsDocument | null>(null);
 const renderedPage = ref<PageSize>({ width: 794, height: 1123 });
 const renderError = ref('');
 const isRendering = ref(false);
@@ -298,6 +340,7 @@ const signatureDrawing = ref(false);
 const signatureImage = ref<ImageAsset | null>(null);
 const snackbar = ref<SnackbarState>({ show: false, text: '', color: 'primary' });
 const zoom = ref(1);
+const dragState = ref<DragState | null>(null);
 let renderSequence = 0;
 
 const viewportWidth = computed(() => Math.round(renderedPage.value.width * zoom.value));
@@ -308,12 +351,17 @@ const pageStyle = computed(() => ({
 }));
 
 const dataFields = computed(() => flattenObject(apiResponse.value));
+const currentPageAnnotations = computed(() => annotations.value.filter((item) => item.page === currentPage.value));
 
 watch(zoom, async () => {
   if (pdfBytes.value) {
     await preparePdfPreview();
   }
 }, { flush: 'post' });
+
+watch(currentPage, (page) => {
+  pageInput.value = page;
+});
 
 onMounted(() => {
   initializeSignaturePad();
@@ -342,6 +390,8 @@ async function loadPdfFile(file: File | null) {
   pdfBytes.value = await readFileBytes(selectedFile);
   annotations.value = [];
   selectedAnnotationId.value = null;
+  currentPage.value = 1;
+  pageInput.value = 1;
   await preparePdfPreview();
 }
 
@@ -360,6 +410,8 @@ async function createBlankPdf() {
   pdfBytes.value = await doc.save();
   annotations.value = [];
   selectedPdfName.value = 'blank-document.pdf';
+  currentPage.value = 1;
+  pageInput.value = 1;
   await preparePdfPreview();
 }
 
@@ -381,11 +433,16 @@ async function preparePdfPreview() {
     }
 
     window.pdfjsLib.GlobalWorkerOptions.workerSrc = '/pdfjs/pdf.worker.min.js';
-    pdfDocument.value = await window.pdfjsLib.getDocument({ data: copyBytes(pdfBytes.value) }).promise;
-    if (renderId !== renderSequence) return;
+    const loadedDocument = await window.pdfjsLib.getDocument({ data: copyBytes(pdfBytes.value) }).promise;
+    pdfDocument.value = markRaw(loadedDocument);
+    if (renderId !== renderSequence || !pdfDocument.value) return;
 
     pageCount.value = pdfDocument.value.numPages;
-    const page = await pdfDocument.value.getPage(currentPage.value);
+    if (currentPage.value > pageCount.value) {
+      currentPage.value = pageCount.value;
+      pageInput.value = pageCount.value;
+    }
+    const page = markRaw(await pdfDocument.value.getPage(currentPage.value));
     if (renderId !== renderSequence) return;
 
     const viewport = page.getViewport({ scale: zoom.value });
@@ -415,6 +472,7 @@ async function preparePdfPreview() {
     hasRenderedPage.value = true;
     showMessage('PDF loaded. Add fields on the page and export when ready.', 'success');
   } catch (error) {
+    console.error('Error preparing PDF preview:', error);
     renderError.value = error instanceof Error ? error.message : 'Unable to preview this PDF.';
   } finally {
     isRendering.value = false;
@@ -432,7 +490,9 @@ function handlePageClick(event: MouseEvent) {
     id: crypto.randomUUID(),
     x,
     y,
-    page: currentPage.value
+    page: currentPage.value,
+    pageWidth: renderedPage.value.width,
+    pageHeight: renderedPage.value.height
   };
 
   if (activeTool.value === 'text') {
@@ -460,6 +520,17 @@ function handlePageClick(event: MouseEvent) {
   }
 }
 
+async function setPage(page: number) {
+  if (!pdfBytes.value || isRendering.value) return;
+  const normalizedPage = Math.min(pageCount.value || 1, Math.max(1, Math.trunc(Number(page) || 1)));
+  pageInput.value = normalizedPage;
+  if (normalizedPage === currentPage.value) return;
+  selectedAnnotationId.value = null;
+  dragState.value = null;
+  currentPage.value = normalizedPage;
+  await preparePdfPreview();
+}
+
 function annotationStyle(item: Annotation) {
   return {
     left: `${item.x * zoom.value}px`,
@@ -472,6 +543,39 @@ function annotationStyle(item: Annotation) {
 
 function annotationImageSrc(item: Annotation): string {
   return item.type === 'image' || item.type === 'signature' ? item.src : '';
+}
+
+function startAnnotationDrag(event: PointerEvent, item: Annotation) {
+  selectedAnnotationId.value = item.id;
+  dragState.value = {
+    id: item.id,
+    pointerId: event.pointerId,
+    startClientX: event.clientX,
+    startClientY: event.clientY,
+    startX: item.x,
+    startY: item.y
+  };
+  (event.currentTarget as HTMLElement).setPointerCapture?.(event.pointerId);
+  window.addEventListener('pointermove', moveAnnotation);
+  window.addEventListener('pointerup', stopAnnotationDrag, { once: true });
+}
+
+function moveAnnotation(event: PointerEvent) {
+  const state = dragState.value;
+  if (!state || event.pointerId !== state.pointerId) return;
+
+  const item = annotations.value.find((annotation) => annotation.id === state.id);
+  if (!item) return;
+
+  const nextX = state.startX + (event.clientX - state.startClientX) / zoom.value;
+  const nextY = state.startY + (event.clientY - state.startClientY) / zoom.value;
+  item.x = clamp(nextX, 0, Math.max(0, renderedPage.value.width - item.width));
+  item.y = clamp(nextY, 0, Math.max(0, renderedPage.value.height - item.height));
+}
+
+function stopAnnotationDrag() {
+  dragState.value = null;
+  window.removeEventListener('pointermove', moveAnnotation);
 }
 
 async function loadImageFile(file: File | File[] | null) {
@@ -615,18 +719,24 @@ function zoomBy(amount: number) {
   zoom.value = Math.min(1.8, Math.max(0.6, Number((zoom.value + amount).toFixed(2))));
 }
 
+function clamp(value: number, min: number, max: number) {
+  return Math.min(max, Math.max(min, value));
+}
+
 async function exportPdf() {
   if (!pdfBytes.value) return;
 
   const doc = await PDFDocument.load(pdfBytes.value);
   const font = await doc.embedFont(StandardFonts.Helvetica);
   const pages = doc.getPages();
-  const page = pages[currentPage.value - 1];
-  const { width: pdfWidth, height: pdfHeight } = page.getSize();
-  const scaleX = pdfWidth / renderedPage.value.width;
-  const scaleY = pdfHeight / renderedPage.value.height;
 
   for (const item of annotations.value) {
+    const page = pages[item.page - 1];
+    if (!page) continue;
+
+    const { width: pdfWidth, height: pdfHeight } = page.getSize();
+    const scaleX = pdfWidth / item.pageWidth;
+    const scaleY = pdfHeight / item.pageHeight;
     const x = item.x * scaleX;
     const y = pdfHeight - (item.y + item.height) * scaleY;
     const width = item.width * scaleX;
@@ -822,6 +932,10 @@ function readFileBytes(file: File): Promise<Uint8Array> {
   max-width: 220px;
 }
 
+.page-input {
+  max-width: 76px;
+}
+
 .workspace {
   align-items: flex-start;
   display: flex;
@@ -913,6 +1027,7 @@ function readFileBytes(file: File): Promise<Uint8Array> {
   overflow: hidden;
   padding: 4px 6px;
   position: absolute;
+  touch-action: none;
   word-break: break-word;
 }
 
@@ -920,6 +1035,11 @@ function readFileBytes(file: File): Promise<Uint8Array> {
 .annotation.selected {
   border-color: #1769aa;
   outline: 2px solid rgb(23 105 170 / 14%);
+}
+
+.annotation.dragging {
+  cursor: grabbing;
+  opacity: 0.86;
 }
 
 .annotation-text,
